@@ -5,7 +5,7 @@ ArmoRM has 19 labeled reward heads — helpfulness, safety, honesty, and 16 othe
 **Model:** RLHFlow/ArmoRM-Llama3-8B-v0.1  
 **Datasets:** Anthropic/hh-rlhf, allenai/reward-bench, nvidia/HelpSteer2
 
-**Full report available in REPORT.pdf**
+**REPORT.pdf has the full analysis**
 ---
 
 ## What I found
