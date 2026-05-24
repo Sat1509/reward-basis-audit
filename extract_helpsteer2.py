@@ -1,33 +1,11 @@
 """
 extract_helpsteer2.py
+Builds chosen/rejected pairs from HelpSteer2 and saves pair metadata for scoring.
 
-Runs ArmoRM on HelpSteer2 and saves head scores + hidden states.
-
-HelpSteer2 structure:
-  - Each row: (prompt, response, helpfulness, correctness, coherence, complexity, verbosity)
-  - Multiple responses per prompt exist (different rows, same prompt)
-  - Ratings are integers 0-4 (Likert scale)
-
-We construct TWO kinds of pairs:
-
-  TYPE A — Overall pairs:
-    For each prompt with 2+ responses, pick the pair with the
-    largest total rating gap (sum of all 5 dimensions).
-    "chosen" = higher total, "rejected" = lower total.
-    This mirrors hh-rlhf logic for a direct comparison.
-
-  TYPE B — Dimension-targeted pairs:
-    For each of the 5 dimensions, build pairs where:
-      - That dimension has a gap of >= 2
-      - All other dimensions differ by <= 1
-    This lets us ask: when helpfulness is the primary difference,
-    does the helpfulness head agree?
-    This is the test ArmoRM's paper never ran.
-
-Why two types?
-  Type A = apples-to-apples comparison with hh-rlhf results.
-  Type B = the targeted test that uniquely exploits HelpSteer2's structure.
-  Type B is the novel finding. Type A is the sanity check.
+TYPE A — overall pairs: highest vs lowest total rating per prompt. Direct hh-rlhf comparison.
+TYPE B — dimension-targeted pairs: one dimension differs by >=2, all others by <=1.
+Type B is the novel test — when helpfulness is the isolated variable, does the helpfulness head agree?
+This is the test ArmoRM's paper never ran.
 """
 
 import json
@@ -35,13 +13,11 @@ import numpy as np
 from datasets import load_dataset
 from collections import defaultdict
 
-# ── CONFIG ──────────────────────────────────────────────────────────────────
-
 DATASET_NAME = "nvidia/HelpSteer2"
 SPLIT = "train"
 OUTPUT_DIR = "outputs_helpsteer2"
 
-# ArmoRM head names (same order as the model outputs)
+# same order as model outputs — 19 heads
 HEAD_NAMES = [
     "helpfulness", "correctness", "coherence", "complexity", "verbosity",
     "safety", "instruction_following", "honesty", "truthfulness", "harmlessness",
@@ -49,10 +25,10 @@ HEAD_NAMES = [
     "clarity", "engagement", "conciseness", "relevance"
 ]
 
-# HelpSteer2 dimension names (subset of head names — these 5 overlap exactly)
+# these 5 overlap exactly with HelpSteer2's annotation dimensions
 HS2_DIMS = ["helpfulness", "correctness", "coherence", "complexity", "verbosity"]
 
-# Pair construction thresholds for TYPE B
+# TYPE B thresholds
 TARGET_DIM_GAP = 2      # target dimension must differ by at least this
 CONTROL_DIM_GAP = 1     # other dimensions must differ by at most this
 MAX_PAIRS_PER_DIM = 200 # cap per dimension to keep compute manageable
@@ -61,17 +37,12 @@ import os
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-# ── BLOCK 1: LOAD AND GROUP BY PROMPT ───────────────────────────────────────
-# What: Load HelpSteer2, group all responses by prompt text.
-# Why: We need multiple responses to the same prompt to form pairs.
-#      Without grouping, we can't compare two responses to the same question.
-# Output: dict of {prompt_text: [list of response dicts]}
+# ---
 
 print("Loading HelpSteer2 ...")
 ds = load_dataset(DATASET_NAME, split=SPLIT)
 print(f"  {len(ds)} rows loaded")
 
-# Group rows by prompt
 grouped = defaultdict(list)
 for row in ds:
     grouped[row["prompt"]].append({
@@ -89,24 +60,19 @@ multi_prompts = {p: resps for p, resps in grouped.items() if len(resps) >= 2}
 print(f"  {len(multi_prompts)} prompts with 2+ responses")
 
 
-# ── BLOCK 2: BUILD TYPE A PAIRS (overall) ───────────────────────────────────
-# What: For each prompt, find the pair of responses with the largest
-#       total rating gap. chosen = higher total, rejected = lower.
-# Why: Mirrors hh-rlhf structure — overall preference, no dimension control.
-#      Lets us directly compare HelpSteer2 validity results to hh-rlhf results.
-# Output: list of (prompt, chosen_response, rejected_response, metadata)
+# ---
+# TYPE A: highest vs lowest total rating per prompt. Mirrors hh-rlhf for direct comparison.
 
 print("\nBuilding TYPE A pairs (overall preference) ...")
 type_a_pairs = []
 
 for prompt, responses in multi_prompts.items():
-    # Sort by total score descending
     sorted_resps = sorted(responses, key=lambda x: x["total"], reverse=True)
     best = sorted_resps[0]
     worst = sorted_resps[-1]
     gap = best["total"] - worst["total"]
     
-    if gap > 0:  # only keep pairs where there's actually a difference
+    if gap > 0:
         type_a_pairs.append({
             "prompt": prompt,
             "chosen_response": best["response"],
@@ -120,31 +86,24 @@ for prompt, responses in multi_prompts.items():
 print(f"  {len(type_a_pairs)} TYPE A pairs constructed")
 
 
-# ── BLOCK 3: BUILD TYPE B PAIRS (dimension-targeted) ────────────────────────
-# What: For each of 5 dimensions, find pairs where that dimension has a
-#       large gap (>=2) but other dimensions are similar (gap <=1).
-# Why: This is the core novel test. If we find a pair where response A
-#      scores 4 on helpfulness and response B scores 1, but they're equal
-#      on everything else — does ArmoRM's helpfulness head agree?
-#      This isolates one dimension, which hh-rlhf cannot do.
-# Output: dict of {dimension: [list of targeted pairs]}
+# ---
+# TYPE B: isolate one dimension per pair. If helpfulness differs by >=2 but everything else
+# differs by <=1, does the helpfulness head correctly rank chosen above rejected?
 
 print("\nBuilding TYPE B pairs (dimension-targeted) ...")
 type_b_pairs = defaultdict(list)
 
 for target_dim in HS2_DIMS:
     other_dims = [d for d in HS2_DIMS if d != target_dim]
-    
+
     for prompt, responses in multi_prompts.items():
-        # Try all pairs of responses for this prompt
         for i in range(len(responses)):
             for j in range(i + 1, len(responses)):
                 r1, r2 = responses[i], responses[j]
-                
+
                 target_gap = abs(r1[target_dim] - r2[target_dim])
                 other_gaps = [abs(r1[d] - r2[d]) for d in other_dims]
-                
-                # Check criteria
+
                 if target_gap >= TARGET_DIM_GAP and all(g <= CONTROL_DIM_GAP for g in other_gaps):
                     # chosen = higher on target dimension
                     chosen = r1 if r1[target_dim] > r2[target_dim] else r2
@@ -162,9 +121,8 @@ for target_dim in HS2_DIMS:
                         "pair_type": f"targeted_{target_dim}"
                     })
     
-    # Cap to avoid runaway compute
     if len(type_b_pairs[target_dim]) > MAX_PAIRS_PER_DIM:
-        # Sort by target gap descending (cleaner signal first) then cap
+        # strongest signal first, then cap
         type_b_pairs[target_dim].sort(key=lambda x: x["target_gap"], reverse=True)
         type_b_pairs[target_dim] = type_b_pairs[target_dim][:MAX_PAIRS_PER_DIM]
     
@@ -174,11 +132,8 @@ total_b = sum(len(v) for v in type_b_pairs.values())
 print(f"  Total TYPE B pairs: {total_b}")
 
 
-# ── BLOCK 4: FLATTEN ALL PAIRS FOR SCORING ──────────────────────────────────
-# What: Combine all pairs into one flat list for ArmoRM to score.
-# Why: We run ArmoRM once on everything. Scoring is the expensive step
-#      (GPU time). We save all scores, then split by pair type for analysis.
-# Output: flat list of all pairs, with type/dim metadata preserved
+# ---
+# flatten TYPE A + TYPE B into one list — score once, split by pair_type later
 
 all_pairs = type_a_pairs.copy()
 for dim, pairs in type_b_pairs.items():
@@ -189,11 +144,8 @@ print(f"  TYPE A (overall): {len(type_a_pairs)}")
 print(f"  TYPE B (targeted): {total_b}")
 
 
-# ── BLOCK 5: SAVE PAIR METADATA ──────────────────────────────────────────────
-# What: Save the pair list (without scores) so we can reconstruct
-#       which pair is which after scoring.
-# Why: ArmoRM outputs arrays indexed by position. We need the metadata
-#      to map position → pair type → dimension → analysis.
+# ---
+# ArmoRM outputs arrays indexed by position — metadata maps position → pair_type → dimension.
 
 metadata_path = os.path.join(OUTPUT_DIR, "metadata.json")
 with open(metadata_path, "w") as f:

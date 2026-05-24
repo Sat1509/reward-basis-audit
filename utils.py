@@ -17,8 +17,6 @@ import numpy as np
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-# Constants:
-
 MODEL_ID    = "RLHFlow/ArmoRM-Llama3-8B-v0.1"
 DATASET_ID  = "Anthropic/hh-rlhf"
 DATA_SPLIT  = "train"
@@ -61,10 +59,7 @@ META_PATH       = os.path.join(SAVE_DIR, "metadata.json")
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 
-# Dataset loading:
-# We load MAX_SAMPLES chosen/rejected pairs from hh-rlhf.
-# Each example is a dict with keys: 'chosen', 'rejected', 'index'.
-
+# Yields dicts with 'chosen', 'rejected', 'index' — downstream scripts rely on this shape.
 def load_dataset_pairs(max_samples=MAX_SAMPLES):
     print(f"Loading dataset: {DATASET_ID} ...")
     dataset = load_dataset(DATASET_ID, split=DATA_SPLIT)
@@ -83,10 +78,7 @@ def load_dataset_pairs(max_samples=MAX_SAMPLES):
     return pairs
 
 
-# Model loading:
-# We load in float16 to fit on a Colab T4 (15GB VRAM).
-# trust_remote_code=True is required for ArmoRM's custom model class.
-
+# float16 to fit on T4 (15GB). trust_remote_code required for ArmoRM's custom class.
 def load_model_and_tokenizer(model_id=MODEL_ID):
     print("Loading tokenizer ...")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -109,14 +101,9 @@ def load_model_and_tokenizer(model_id=MODEL_ID):
     return tokenizer, model
 
 
-# Tokenization:
-# hh-rlhf stores text as "Human: ...\n\nAssistant: ..."
-# We split on the last Assistant turn and apply ArmoRM's chat template.
-
-# Note: ArmoRM's gating network calls find_token_for_gating() internally,
-# which looks for the token pattern [128009, 128006, 78191, 128007, 271].
-# apply_chat_template guarantees this pattern is present. Raw tokenization breaks it.
-
+# hh-rlhf text is "Human: ...\n\nAssistant: ..." — we parse and reformat before scoring.
+# gating network requires chat template — it searches for token pattern [128009, 128006, 78191, 128007, 271].
+# raw tokenization won't produce this and silently breaks find_token_for_gating().
 def tokenize_text(text, tokenizer, max_length=MAX_LENGTH):
     if "\n\nAssistant:" in text:
         prompt_part, response_part = text.rsplit("\n\nAssistant:", 1)
@@ -146,12 +133,7 @@ def tokenize_text(text, tokenizer, max_length=MAX_LENGTH):
     return {k: v.to(DEVICE) for k, v in encoded.items()}
 
 
-#Single-example scoring:
-# One forward pass through ArmoRM. Returns all three outputs we need:
-#   head_scores  (19,)   — raw reward head scores
-#   hidden_state (4096,) — pooled last-token embedding
-#   gating       (19,)   — softmax mixing weights from GatingNetwork
-
+# One forward pass. Returns head_scores (19,), hidden_state (4096,), gating (19,).
 def score_text(text, tokenizer, model):
     inputs = tokenize_text(text, tokenizer)
 
@@ -165,11 +147,7 @@ def score_text(text, tokenizer, model):
     return head_scores, hidden_state, gating
 
 
-# Batch scoring:
-# Runs score_text on every chosen and rejected response.
-# Returns six arrays, all row-aligned to pairs[i].
-# Runtime: ~45-55 min for 800 pairs on a T4.
-
+# Returns six arrays row-aligned to pairs[i]. ~45-55 min for 800 pairs on T4.
 def score_all_pairs(pairs, tokenizer, model):
     chosen_scores,  rejected_scores  = [], []
     chosen_hidden,  rejected_hidden  = [], []
@@ -197,10 +175,7 @@ def score_all_pairs(pairs, tokenizer, model):
     )
 
 
-# Save outputs:
-# Arrays are stacked as (N, 2, dim) — axis 1 is [chosen=0, rejected=1].
-# This convention is used consistently across all analysis scripts.
-
+# axis 1: [chosen=0, rejected=1] — load_outputs() unpacks using the same convention.
 def save_outputs(chosen_scores, rejected_scores,
                  chosen_hidden, rejected_hidden,
                  chosen_gating, rejected_gating,
@@ -233,11 +208,7 @@ def save_outputs(chosen_scores, rejected_scores,
     print(f"Saved metadata     -> {META_PATH}")
 
 
-# Load outputs :
-# All analysis scripts call this instead of re-running the model.
-# Note: if SAVE_DIR is overridden in a script (e.g. for rewardbench outputs),
-# update SCORES_PATH etc. before calling this function.
-
+# If SAVE_DIR is overridden in another script, update SCORES_PATH etc. before calling this.
 def load_outputs():
     scores  = np.load(SCORES_PATH)
     hiddens = np.load(EMBEDDINGS_PATH)

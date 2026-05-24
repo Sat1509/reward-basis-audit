@@ -50,28 +50,12 @@ SAFETY_IDX     = HEAD_NAMES.index('safety')
 READABILITY_IDX = HEAD_NAMES.index('readability')
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BLOCK 1: Validity metrics — same as validity_check.py
-# ══════════════════════════════════════════════════════════════════════════════
-# For each head:
-#   gap[i] = chosen_score[i] - rejected_score[i]  for each pair i
-#   preference_accuracy = fraction of pairs where gap > 0
-#   Wilcoxon signed-rank test on gaps (tests whether median gap ≠ 0)
-#   Cohen's d = mean(gap) / std(gap)
-#
-# Same thresholds as before:
-#   strongly valid  : acc ≥ 0.65, p < 0.05
-#   weakly valid    : acc ≥ 0.55, p < 0.05
-#   invalid         : everything else
+# ---
+# same validity metrics as validity_check.py: preference_accuracy, cohen_d, Wilcoxon p-value
+# thresholds: strongly valid ≥0.65, weakly valid ≥0.55, invalid otherwise
 
 def compute_validity(head_scores):
-    """
-    Args:
-        head_scores : (N, 2, 19) — axis 1: [chosen=0, rejected=1]
-
-    Returns:
-        results : list of dicts, one per head
-    """
+    """head_scores: (N, 2, 19), axis 1: [chosen=0, rejected=1]. Returns list of dicts per head."""
     chosen   = head_scores[:, 0, :]    # (N, 19)
     rejected = head_scores[:, 1, :]    # (N, 19)
     gaps     = chosen - rejected        # (N, 19)
@@ -111,31 +95,12 @@ def compute_validity(head_scores):
     return results
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BLOCK 2: Per-subset validity
-# ══════════════════════════════════════════════════════════════════════════════
-# Reward Bench's subset column lets us ask targeted questions:
-#
-#   On pairs where SAFETY was the selection criterion,
-#   does the safety head predict the preference?
-#
-#   On pairs where REASONING was the selection criterion,
-#   does the correctness/depth head predict the preference?
-#
-# This is a much cleaner test than overall validity because each subset
-# controls for what the human rater was evaluating.
-#
-# We run compute_validity() separately on the rows belonging to each subset.
+# ---
+# Per-subset validity: does the safety head fail specifically on safety-labeled pairs?
+# Each subset controls what the human rater was evaluating — cleaner than overall validity.
 
 def compute_validity_by_subset(head_scores, subsets):
-    """
-    Args:
-        head_scores : (N, 2, 19)
-        subsets     : list of N subset labels
-
-    Returns:
-        by_subset : dict mapping subset_name → validity results list
-    """
+    """Runs compute_validity() for each subset. Returns dict of subset_name → results."""
     subsets_arr = np.array(subsets)
     unique = sorted(set(subsets))
     by_subset = {}
@@ -144,27 +109,16 @@ def compute_validity_by_subset(head_scores, subsets):
         mask = subsets_arr == s
         subset_scores = head_scores[mask]
         if len(subset_scores) < 10:
-            continue   # too few pairs for meaningful statistics
+            continue  # too few pairs for meaningful statistics
         by_subset[s] = compute_validity(subset_scores)
         print(f"  Subset '{s}': {mask.sum()} pairs")
 
     return by_subset
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BLOCK 3: Comparison with hh-rlhf
-# ══════════════════════════════════════════════════════════════════════════════
-# Load hh-rlhf validity results if available (from outputs/validity_results.json)
-# and build a side-by-side comparison table.
-#
-# The comparison tells us whether our findings are:
-#   Consistent across datasets  → property of the model
-#   Dataset-specific            → property of hh-rlhf's construction
-#
-# For the safety head specifically, we want to compare:
-#   hh-rlhf overall: 0.520
-#   Reward Bench overall: ?
-#   Reward Bench safety subset: ?    ← most important number
+# ---
+# cross-dataset comparison: consistent findings → model property; divergent → hh-rlhf construction.
+# key number: safety head on Reward Bench's safety subset specifically.
 
 def load_hhrxlhf_results():
     path = f'{HHRXLHF_DIR}/validity_results.json'
@@ -176,13 +130,11 @@ def load_hhrxlhf_results():
 
 
 def build_comparison(rb_results, hh_results):
-    """
-    Returns a list of dicts with pref_acc from both datasets per head.
-    """
+    """Returns per-head pref_acc from both datasets for side-by-side comparison."""
     if hh_results is None:
         return None
 
-    # hh-rlhf results might be a dict or list depending on how validity_check.py saved them
+    # hh-rlhf results might be dict or list depending on how validity_check.py saved them
     if isinstance(hh_results, dict):
         hh_by_head = hh_results
     else:
@@ -201,15 +153,13 @@ def build_comparison(rb_results, hh_results):
             'consistent'    : abs(
                 (hh.get('pref_acc', 0.5) - 0.5) -
                 (rb.get('pref_acc', 0.5) - 0.5)
-            ) < 0.10   # within 10pp = consistent direction
+            ) < 0.10  # within 10pp = consistent direction
         })
 
     return comparison
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PRINTING
-# ══════════════════════════════════════════════════════════════════════════════
+# ---
 
 def print_results(results, label=""):
     n = results[0]['n_pairs']
@@ -236,7 +186,7 @@ def print_results(results, label=""):
 
 
 def print_subset_safety(by_subset):
-    """Print safety head results for each subset."""
+    """Safety head preference accuracy per subset."""
     print(f"\n── Safety head preference accuracy by subset ───────────────────────────────")
     print(f"  {'Subset':<40} {'N':>5}  {'Acc':>6}  {'p':>8}  Interpretation")
     print(f"  {'-'*75}")
@@ -262,9 +212,7 @@ def print_comparison(comparison):
         print(f"  {r['head']:<26} {hh:>8.3f}  {rb:>9.3f}  {delta:>+6.3f}  {flag}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PLOTTING
-# ══════════════════════════════════════════════════════════════════════════════
+# ---
 
 def plot_results(rb_results, by_subset, comparison):
     fig = plt.figure(figsize=(18, 12))
@@ -273,7 +221,7 @@ def plot_results(rb_results, by_subset, comparison):
     accs   = [r['pref_acc'] for r in rb_results]
     colors = ['green' if a >= 0.65 else 'orange' if a >= 0.55 else 'red' for a in accs]
 
-    # Panel 1: Overall Reward Bench validity
+    # panel 1: overall validity
     ax1 = fig.add_subplot(gs[0, 0])
     bars = ax1.barh(HEAD_NAMES, accs, color=colors, alpha=0.75)
     ax1.axvline(0.5,  color='black', linestyle='--', linewidth=1, label='Chance (0.50)')
@@ -283,7 +231,7 @@ def plot_results(rb_results, by_subset, comparison):
     ax1.set_xlim(0.3, 0.85)
     ax1.legend(fontsize=8)
 
-    # Panel 2: Safety head across subsets
+    # panel 2: safety head by subset
     ax2 = fig.add_subplot(gs[0, 1])
     subset_names = sorted(by_subset.keys())
     safety_accs  = [next(r for r in by_subset[s] if r['head'] == 'safety')['pref_acc']
@@ -298,7 +246,7 @@ def plot_results(rb_results, by_subset, comparison):
                   fontsize=10, fontweight='bold')
     ax2.set_xlim(0.3, 0.85)
 
-    # Panel 3: Cross-dataset comparison (if available)
+    # panel 3: cross-dataset comparison
     ax3 = fig.add_subplot(gs[1, :])
     if comparison is not None:
         hh_accs = [r['hhrxlhf_acc']    for r in comparison if r['hhrxlhf_acc'] is not None]
@@ -329,9 +277,7 @@ def plot_results(rb_results, by_subset, comparison):
     print(f"Saved figure → {out}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════════════════════
+# ---
 
 def main():
     print("Loading Reward Bench outputs ...")
@@ -342,23 +288,19 @@ def main():
     N = len(subsets)
     print(f"  {N} pairs, {len(set(subsets))} subsets")
 
-    # ── Overall validity ──────────────────────────────────────────────────────
     print("\nComputing overall validity ...")
     rb_results = compute_validity(head_scores)
     print_results(rb_results, label="— Reward Bench (all subsets)")
 
-    # ── Per-subset validity ───────────────────────────────────────────────────
     print("\nComputing per-subset validity ...")
     by_subset = compute_validity_by_subset(head_scores, subsets)
     print_subset_safety(by_subset)
 
-    # ── Cross-dataset comparison ──────────────────────────────────────────────
     print("\nLoading hh-rlhf results for comparison ...")
     hh_results = load_hhrxlhf_results()
     comparison = build_comparison(rb_results, hh_results)
     print_comparison(comparison)
 
-    # ── Save results ──────────────────────────────────────────────────────────
     with open(f'{OUTPUT_DIR}/validity_results.json', 'w') as f:
         json.dump(rb_results, f, indent=2)
 
@@ -375,10 +317,8 @@ def main():
     if comparison:
         print(f"Saved → {OUTPUT_DIR}/validity_comparison.json")
 
-    # ── Plot ──────────────────────────────────────────────────────────────────
     plot_results(rb_results, by_subset, comparison)
 
-    # ── Headline ──────────────────────────────────────────────────────────────
     valid    = [r['head'] for r in rb_results if 'strongly' in r['interpretation']]
     safety_r = next(r for r in rb_results if r['head'] == 'safety')
 

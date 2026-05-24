@@ -1,33 +1,8 @@
 # activation_analysis.py
-#
-# Research question answered here:
-#   Which tokens and layers drive each reward head?
-#   Does the "safety" head actually activate more on safety-relevant tokens
-#   (refusals, warnings, harmful content markers)?
-#   Does "helpfulness" activate on substantive answer tokens?
-#
-#   This is the mechanistic interpretability core — we're not just asking
-#   "does the head score high?" but "what in the input causes it to score high?"
-#
-# Method:
-#   Input x Output Gradient attribution — for each head, we compute the
-#   gradient of that head's score with respect to each token's embedding.
-#   Tokens with high gradient magnitude = tokens that most influence that head.
-#
-#   This is the same family as Integrated Gradients (which you know from your
-#   XAI background), but simpler: one-shot gradient rather than path integral.
-#   Mention this connection explicitly to Rachel — it shows methodological continuity.
-#
-# Outputs:
-#   outputs/activation_top_tokens.json     — top influential tokens per head
-#   outputs/activation_layer_norms.npy     — per-layer activation norms
-#   outputs/activation_examples.txt        — human-readable token attribution examples
-#
-# Usage:
-#   python activation_analysis.py
-#   (Requires outputs/ populated by extract_scores_and_embeddings.py)
-#   NOTE: This script re-loads the model because it needs gradients.
-#         Run on GPU. Expects ~20-30 min for 200 examples.
+# Asks which tokens most influence each reward head via input-gradient attribution:
+# gradient of head_score w.r.t. token embeddings, L2 norm gives per-token importance.
+# Same family as Integrated Gradients but one-shot rather than path integral.
+# Re-loads model in float32 — gradients break under float16. ~20-30 min for 200 examples.
 
 import numpy as np
 import json
@@ -72,46 +47,34 @@ HEAD_KEYWORDS = {
 }
 
 
-# ── Block 1: Gradient attribution for one example ─────────────────────────────
+# ---
 
 def attribute_tokens(text, tokenizer, model, head_idx):
     """
-    For a single text and a single reward head:
-    1. Tokenize the text
-    2. Forward pass with gradient tracking enabled
-    3. Compute gradient of head_idx score w.r.t. each token embedding
-    4. Attribution score = L2 norm of gradient vector at each token position
-
-    Returns:
-        tokens      : list of decoded token strings
-        attributions: np.array of shape (seq_len,) — one score per token
+    Forward pass with gradient tracking, then L2 norm of d(head_score)/d(embedding)
+    at each token position. Returns (tokens, attributions) where attributions.shape == (seq_len,).
     """
     inputs = tokenize_text(text, tokenizer)
 
-    # We need gradients w.r.t. embeddings, not weights
-    # Get the embedding layer output and enable grad
+    # gradients w.r.t. embeddings, not weights
     model.eval()
 
-    # Hook to capture embeddings
     embeddings_ref = {}
 
     def embedding_hook(module, input, output):
         embeddings_ref["embeddings"] = output
         output.retain_grad()
 
-    # Register hook on the embedding layer
-    # For Llama3 this is model.model.embed_tokens
+    # for Llama3 the embedding layer is model.model.embed_tokens
     hook = model.model.embed_tokens.register_forward_hook(embedding_hook)
 
     try:
         outputs = model(**inputs)
-        head_score = outputs.logits[0, head_idx]  # Scalar score for this head
+        head_score = outputs.logits[0, head_idx]
 
-        # Backpropagate through the head score
         model.zero_grad()
         head_score.backward()
 
-        # Gradient at each token position: shape (seq_len, hidden_size)
         grads = embeddings_ref["embeddings"].grad  # (1, seq_len, hidden_size)
 
         if grads is None:
@@ -119,7 +82,7 @@ def attribute_tokens(text, tokenizer, model, head_idx):
 
         grads = grads[0].detach().cpu().float().numpy()  # (seq_len, hidden_size)
 
-        # Attribution = L2 norm of gradient at each token
+        # L2 norm across hidden dim gives a scalar importance per token
         attributions = np.linalg.norm(grads, axis=-1)  # (seq_len,)
 
         # Decode tokens
@@ -132,19 +95,13 @@ def attribute_tokens(text, tokenizer, model, head_idx):
     return tokens, attributions
 
 
-# ── Block 2: Aggregate top tokens across examples ─────────────────────────────
+# ---
 
 def aggregate_top_tokens(pairs, tokenizer, model, subset=ATTRIBUTION_SUBSET):
     """
-    Runs token attribution on `subset` chosen responses for all 8 heads.
-    For each head, accumulates a frequency-weighted token importance score:
-        token_importance[head][token] += attribution_score
-
-    After aggregating, returns top-N tokens per head by total importance.
-
-    We use chosen responses only — they're the positive signal we want
-    to understand. Rejected responses are the negative contrastive signal
-    handled in validity_check.py.
+    Accumulates attribution scores across `subset` chosen responses and returns top-N
+    tokens per head by total importance. Chosen only — rejected contrastive analysis
+    is in validity_check.py.
     """
     # token_scores[head_name][token_string] = cumulative attribution
     token_scores = {h: collections.defaultdict(float) for h in HEAD_NAMES}
@@ -171,9 +128,8 @@ def aggregate_top_tokens(pairs, tokenizer, model, subset=ATTRIBUTION_SUBSET):
             attributions = attributions / total_attr
 
             for token, score in zip(tokens, attributions):
-                # Clean token: strip whitespace, lowercase
                 clean = token.strip().lower()
-                if len(clean) < 2:   # Skip single chars and punctuation
+                if len(clean) < 2:   # skip single chars and punctuation
                     continue
                 token_scores[head_name][clean] += float(score)
 
@@ -193,19 +149,13 @@ def aggregate_top_tokens(pairs, tokenizer, model, subset=ATTRIBUTION_SUBSET):
     return top_tokens
 
 
-# ── Block 3: Keyword overlap analysis ─────────────────────────────────────────
+# ---
 
 def compute_keyword_overlap(top_tokens):
     """
-    For heads where we have semantic expectations (safety, helpfulness, etc.),
-    check what fraction of the top-N tokens are semantically relevant keywords.
-
-    High overlap = the head activates on semantically appropriate tokens.
-    Low overlap  = the head activates on arbitrary / syntactic tokens.
-                   The label does not correspond to what drives the head.
-
-    This is the token-level validity check — complements validity_check.py
-    which operates at the response level.
+    Checks what fraction of each head's top-N tokens fall within expected semantic keywords.
+    Low overlap means the head activates on syntactic/positional features, not the labeled concept.
+    Token-level counterpart to validity_check.py's response-level analysis.
     """
     overlap_results = {}
 
@@ -231,13 +181,10 @@ def compute_keyword_overlap(top_tokens):
     return overlap_results
 
 
-# ── Block 4: Save outputs ─────────────────────────────────────────────────────
+# ---
 
 def save_outputs(top_tokens, overlap_results):
-    """
-    Saves top tokens per head and keyword overlap analysis to JSON.
-    Also writes a human-readable text file for quick inspection.
-    """
+    """Saves top tokens + keyword overlap to JSON and a readable summary to .txt."""
     output = {
         "analysis":        "activation_analysis",
         "method":          "Input x gradient attribution, L2 norm per token",
@@ -251,7 +198,6 @@ def save_outputs(top_tokens, overlap_results):
         json.dump(output, f, indent=2)
     print(f"Top tokens saved -> {TOP_TOKENS_PATH}")
 
-    # Human-readable summary
     with open(EXAMPLES_PATH, "w") as f:
         f.write("ArmoRM Activation Analysis — Top Tokens Per Reward Head\n")
         f.write("=" * 60 + "\n\n")
@@ -272,16 +218,14 @@ def save_outputs(top_tokens, overlap_results):
     print(f"Readable summary -> {EXAMPLES_PATH}")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ---
 
 def main():
     print("Loading dataset ...")
     pairs = load_dataset_pairs()
 
     print("\nLoading model (gradients required — float16 + no_grad won't work here) ...")
-    # For gradient attribution we need float32 on at least the embedding layer
-    # We reload the model here without float16 quantization for correctness
-    # This uses more VRAM — if OOM, reduce ATTRIBUTION_SUBSET to 100
+    # float32 required for gradient stability; uses more VRAM than extraction — reduce ATTRIBUTION_SUBSET to 100 if OOM
     from transformers import AutoTokenizer, AutoModelForSequenceClassification
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -293,8 +237,7 @@ def main():
         torch_dtype=torch.float32,   # float32 for gradient stability
         device_map="auto"
     )
-    # Do NOT call model.eval() fully — we need gradients
-    # But disable dropout manually
+    # don't call model.eval() — need gradients; manually zero dropout instead
     for module in model.modules():
         if isinstance(module, torch.nn.Dropout):
             module.p = 0.0

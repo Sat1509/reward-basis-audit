@@ -45,8 +45,6 @@ import json
 import os
 import sys
 
-# ── Constants ──────────────────────────────────────────────────────────────────
-
 HEAD_NAMES = [
     'helpfulness', 'correctness', 'coherence', 'complexity', 'verbosity',
     'safety', 'instruction_following', 'honesty', 'truthfulness', 'harmlessness',
@@ -58,30 +56,13 @@ N = len(HEAD_NAMES)   # 19
 os.makedirs('outputs', exist_ok=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BLOCK 1: Load regression layer weights
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# The regression_layer is a Linear(4096 → 19) layer with no bias.
-# Its weight matrix W has shape (19, 4096).
-# Row i of W is the weight vector w_i for head i — a direction in the 4096-dim
-# hidden space. The raw score for head i is:
-#
-#   score_i(h) = w_i · h     (dot product with the pooled hidden state h)
-#
-# This is the object we analyze geometrically. Everything downstream is
-# operations on W and on the saved hidden states H.
-#
-# We cache W to outputs/regression_weights.npy so the model doesn't need
-# to be reloaded. Alternatively, add one line to extract_scores_and_embeddings.py:
-#   np.save('outputs/regression_weights.npy',
-#           model.regression_layer.weight.detach().float().cpu().numpy())
+# ---
+# regression_layer is Linear(4096 → 19), no bias. Row i of W is the direction
+# in hidden space that head i scores along: score_i(h) = w_i · h.
+# We cache W to avoid reloading the model on subsequent runs.
 
 def load_regression_weights():
-    """
-    Returns W ∈ ℝ^{19×4096}.
-    Loads from cache if available; otherwise loads full model, extracts W, saves cache.
-    """
+    """Returns W ∈ ℝ^{19×4096}. Loads from cache if available; otherwise extracts from model."""
     cache = 'outputs/regression_weights.npy'
     if os.path.exists(cache):
         W = np.load(cache)
@@ -90,13 +71,12 @@ def load_regression_weights():
 
     print("Cache not found — loading model to extract regression_layer.weight ...")
     try:
-        # Reuse utils.py if available — avoids duplicating model loading logic
         sys.path.insert(0, '.')
         from utils import load_model_and_tokenizer
         model, _ = load_model_and_tokenizer()
         W = model.regression_layer.weight.detach().float().cpu().numpy()
     except ImportError:
-        # Fallback: standalone load. CPU only — we just need the weight matrix.
+        # fallback: CPU-only load, we only need the weight matrix
         import torch
         from transformers import AutoModelForSequenceClassification
         model = AutoModelForSequenceClassification.from_pretrained(
@@ -113,41 +93,14 @@ def load_regression_weights():
     return W
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BLOCK 2: Gram matrix and cosine similarity
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# The Gram matrix G = W Wᵀ has entries:
-#   G_ij = wᵢ · wⱼ   (raw dot product between head i and head j weight vectors)
-#
-# Normalizing each row of W to unit length gives Ŵ (unit-norm rows).
-# The cosine similarity matrix is:
-#   C = Ŵ Ŵᵀ   where C_ij = (wᵢ · wⱼ) / (‖wᵢ‖ ‖wⱼ‖) ∈ [-1, 1]
-#   C_ii = 1 by construction.
-#
-# Interpretation:
-#   C ≈ I  →  the 19 weight vectors are mutually orthogonal. The architecture
-#              defines 19 independent directions. Any behavioral correlation
-#              between heads must be a property of the data, not the architecture.
-#
-#   Large off-diagonal C_ij  →  weight vectors share directions. The model
-#              collapsed these concepts at the architecture level.
-#
-# Orthogonality gap: ‖C − I‖_F / √(N(N−1))
-#   Normalizing by √(N(N−1)) accounts for the N(N−1) off-diagonal entries,
-#   giving a value in [0, 1] where 0 = perfect orthogonality.
+# ---
+# Gram matrix: G_ij = wᵢ · wⱼ. Cosine similarity: C = ŴŴᵀ where Ŵ has unit-norm rows.
+# C ≈ I → orthogonal weight vectors → any behavioral correlation is data-driven, not architectural.
+# Large off-diagonal C_ij → the model collapsed these concepts at the weight level.
+# Orthogonality gap: ‖C − I‖_F / √(N(N−1)), normalized to [0,1].
 
 def gram_analysis(W):
-    """
-    Args:
-        W : (N, 4096) weight matrix
-
-    Returns:
-        C        : (N, N) cosine similarity matrix of weight vectors
-        G        : (N, N) raw Gram matrix
-        orth_gap : scalar ∈ [0,1], 0 = perfectly orthogonal
-        norms    : (N,) L2 norm of each row of W
-    """
+    """Returns C (N,N cosine sim), G (N,N raw Gram), orth_gap ∈ [0,1] (0=orthogonal), norms (N,)."""
     norms = np.linalg.norm(W, axis=1)              # (N,)
     W_hat = W / norms[:, np.newaxis]               # (N, 4096) unit-norm rows
 
@@ -160,51 +113,20 @@ def gram_analysis(W):
     return C, G, orth_gap, norms
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BLOCK 3: SVD and effective rank
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# The singular value decomposition of W is:
-#   W = U Σ Vᵀ
-#   U ∈ ℝ^{N×N}      — left singular vectors (how heads mix into components)
-#   Σ ∈ ℝ^{N×N}      — diagonal, singular values σ₁ ≥ σ₂ ≥ ... ≥ σ_N ≥ 0
-#   Vᵀ ∈ ℝ^{N×4096}  — right singular vectors (actual directions in hidden space)
-#
-# Each row of Vᵀ is one independent direction the model uses for scoring.
-# Each σᵢ is the magnitude of that direction — how much "signal" is in it.
-#
-# If all σᵢ are equal → W has full rank N, all 19 directions are equally used.
-# If σᵢ drops to near zero for i > k → the 19 heads effectively span only a
-# k-dimensional subspace. They are not 19 independent axes.
-#
-# Effective rank measures (Roy & Vetterli, 2007):
-#
-#   Participation ratio = (Σ σᵢ)² / Σ σᵢ²
-#     = N if all singular values equal (full effective rank)
-#     = 1 if one singular value dominates (rank-1 effective structure)
-#
-#   Entropy rank = exp(−Σ pᵢ log pᵢ)  where pᵢ = σᵢ² / Σ σⱼ²
-#     = Shannon entropy of the squared singular value distribution
-#     = N for uniform spectrum (maximum diversity), = 1 for peaked spectrum
-#
-#   Condition number κ = σ_max / σ_min
-#     κ >> 1 → near-linear-dependence among rows → ill-conditioned weight matrix
-#     Geometrically: some heads are almost linear combinations of others.
+# ---
+# SVD: W = UΣVᵀ. Each row of Vᵀ is an independent scoring direction; σᵢ is its magnitude.
+# If σᵢ → 0 for i > k, the 19 heads span only a k-dimensional subspace.
+# Effective rank (Roy & Vetterli 2007):
+#   participation ratio = (Σσᵢ)² / Σσᵢ² — N if uniform, 1 if rank-1
+#   entropy rank = exp(-Σ pᵢ log pᵢ) where pᵢ = σᵢ²/Σσⱼ²
+#   condition number κ = σ_max/σ_min — κ>>1 means some heads are near-linear combinations of others
 
 def svd_analysis(W):
-    """
-    Args:
-        W : (N, 4096) weight matrix
-
-    Returns:
-        U, S, Vt : SVD components. S shape (N,).
-        metrics  : dict of effective rank statistics
-    """
+    """Returns U, S, Vt from np.linalg.svd and a metrics dict with effective rank statistics."""
     U, S, Vt = np.linalg.svd(W, full_matrices=False)    # S: (N,)
 
-    # Squared singular values (proportional to variance explained)
     S2 = S ** 2
-    p = S2 / S2.sum()                                    # probability distribution over components
+    p = S2 / S2.sum()                                    # normalized singular value distribution
 
     participation_ratio = S.sum() ** 2 / S2.sum()
     entropy_rank = float(np.exp(-np.sum(p * np.log(p + 1e-12))))
@@ -212,7 +134,7 @@ def svd_analysis(W):
 
     explained = S2 / S2.sum()
     cumulative = np.cumsum(explained)
-    k90 = int(np.searchsorted(cumulative, 0.90)) + 1     # components needed for 90% of W's variance
+    k90 = int(np.searchsorted(cumulative, 0.90)) + 1     # components to explain 90% of W's variance
 
     metrics = {
         'singular_values'      : S.tolist(),
@@ -226,113 +148,51 @@ def svd_analysis(W):
     return U, S, Vt, metrics
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BLOCK 4: Principal angles between subspaces
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# The principal angles between two subspaces A and B in ℝ^d generalize the
-# concept of angle between two vectors to angle between two subspaces.
-#
-# We compare:
-#   A: row space of W      (directions the model uses for scoring)
-#   B: top-k PCA subspace  (directions of maximum variance in hidden states)
-#
-# If the scoring directions align with the high-variance representation directions
-# (small principal angles), the model scores along features that dominate its
-# internal geometry — a coherent picture.
-#
-# If A ⊥ B (large principal angles), the model scores along directions nearly
-# orthogonal to the hidden state variance — a dissonant picture: high probe
-# accuracy is only possible because some of the 20% un-explained variance lives
-# in the scoring subspace.
-#
-# Algorithm (Björck & Golub, 1973):
-#   1. Orthonormalize rows of A via QR → Q_A ∈ ℝ^{d × r_A}
-#   2. Orthonormalize rows of B via QR → Q_B ∈ ℝ^{d × r_B}
-#   3. Compute M = Q_Aᵀ Q_B ∈ ℝ^{r_A × r_B}  (inner products between bases)
-#   4. SVD of M → singular values σᵢ = cos(θᵢ)
-#   θᵢ = arccos(σᵢ) ∈ [0°, 90°],  θ = 0° means the subspaces share a direction.
+# ---
+# Principal angles between W's row space and the top-k PCA subspace of H (Björck & Golub 1973).
+# Small angles → scoring directions align with high-variance representation directions (coherent).
+# Large angles → model scores along directions nearly orthogonal to H's variance (dissonant).
+# Algorithm: QR both bases → M = Q_Aᵀ Q_B → SVD(M), σᵢ = cos(θᵢ).
 
 def principal_angles(A_rows, B_rows):
     """
-    Compute principal angles between subspace spanned by rows of A_rows
-    and subspace spanned by rows of B_rows.
-
-    Args:
-        A_rows : (m, d) — m vectors in ℝ^d spanning subspace A
-        B_rows : (n, d) — n vectors in ℝ^d spanning subspace B
-
-    Returns:
-        angles_deg : (k,) principal angles in degrees, k = min(rank A, rank B)
+    Principal angles between subspaces spanned by rows of A_rows and B_rows.
+    Returns angles in degrees; k = min(rank A, rank B).
     """
-    # QR on transposed matrices: columns of A_rows.T are the spanning vectors
-    Q_A, _ = np.linalg.qr(A_rows.T)     # (d, rank_A), orthonormal basis for row space of A_rows
-    Q_B, _ = np.linalg.qr(B_rows.T)     # (d, rank_B)
+    Q_A, _ = np.linalg.qr(A_rows.T)     # orthonormal basis for row space of A_rows
+    Q_B, _ = np.linalg.qr(B_rows.T)
 
-    M = Q_A.T @ Q_B                      # (rank_A, rank_B) inner product matrix
+    M = Q_A.T @ Q_B
     sigma = np.linalg.svd(M, compute_uv=False)
     sigma = np.clip(sigma, 0.0, 1.0)     # numerical safety before arccos
 
     return np.degrees(np.arccos(sigma))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BLOCK 5: Entanglement decomposition
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# The core comparison of this script.
-#
-# We have two matrices, both (N, N):
-#   C_weight[i,j] = cosine similarity of weight vectors wᵢ and wⱼ
-#                   (geometric overlap in weight space — architecture property)
-#   C_score[i,j]  = Spearman rank correlation of head i scores vs head j scores
-#                   (behavioral correlation — joint property of architecture + data)
-#
-# We regress C_score on C_weight using the N(N−1)/2 = 171 upper-triangle pairs.
-#
-# The R² of this regression answers: what fraction of behavioral entanglement
-# variance is explained by geometric overlap in the weight matrix?
-#
-#   R² ≈ 0 → entanglement is DATA-DRIVEN.
-#     The weight vectors are orthogonal. The architecture CAN represent independent
-#     reward concepts. But the training distribution never provided inputs where
-#     these concepts diverge, so the heads always fire together.
-#     Fix: targeted contrastive data (e.g., responses that are safe but not honest,
-#     or helpful but not coherent). This is a data problem, not a model problem.
-#
-#   R² ≈ 1 → entanglement is ARCHITECTURE-DRIVEN.
-#     The weight vectors themselves share directions. The model has geometrically
-#     conflated these concepts. Even with perfect training data, the heads would
-#     be correlated because they point in similar directions.
-#     Fix: orthogonality regularization on W during training, or reparametrizing
-#     the reward heads to enforce orthogonal directions.
-#
-#   Intermediate R² → both sources contribute.
+# ---
+# Core test: regress score-space Spearman correlation on weight-space cosine similarity.
+# R² answers what fraction of behavioral entanglement is explained by geometric overlap.
+#   R² ≈ 0 → data-driven: weight vectors are orthogonal, training distribution conflates them.
+#            Fix: targeted contrastive data.
+#   R² ≈ 1 → architecture-driven: weight vectors share directions, model conflated these concepts.
+#            Fix: orthogonality regularization on W.
 
 def entanglement_decomposition(W, scores_flat):
     """
-    Args:
-        W           : (N, 4096) weight matrix
-        scores_flat : (M, N) head scores pooled across all responses
-
-    Returns:
-        C_weight    : (N, N) cosine similarity matrix of weight vectors
-        C_score     : (N, N) Spearman rank correlation matrix of head scores
-        slope, intercept, r2 : linear regression of C_score on C_weight (upper triangle)
-        cos_tri, sp_tri : (171,) upper-triangle values for scatter plot
+    Regresses score-space Spearman correlation on weight-space cosine similarity
+    across all N(N-1)/2 = 171 head pairs. R² separates architecture- from data-driven entanglement.
+    Returns C_weight, C_score (both N,N), slope, intercept, r2, and (171,) upper-triangle arrays.
     """
-    # Weight-space geometry
     norms = np.linalg.norm(W, axis=1)
     W_hat = W / norms[:, np.newaxis]
     C_weight = W_hat @ W_hat.T              # (N, N)
 
-    # Score-space correlation
     C_score = np.zeros((N, N))
     for i in range(N):
         for j in range(N):
             C_score[i, j], _ = stats.spearmanr(scores_flat[:, i], scores_flat[:, j])
 
-    # Upper triangle (excluding diagonal) — 171 pairs
+    # upper triangle (excluding diagonal) — 171 pairs
     idx = np.triu_indices(N, k=1)
     cos_tri = C_weight[idx]
     sp_tri  = C_score[idx]
@@ -343,58 +203,30 @@ def entanglement_decomposition(W, scores_flat):
     return C_weight, C_score, float(slope), float(intercept), float(r2), cos_tri, sp_tri
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BLOCK 6: Projection variance
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# The rows of W span a subspace S_W ⊆ ℝ^{4096} of dimension rank(W) ≤ 19.
-# We ask: what fraction of the variance in the hidden states H lives within S_W?
-#
-# Procedure:
-#   1. Get an orthonormal basis Q for S_W via SVD of W:
-#      Right singular vectors Vᵀ → rows are directions in ℝ^{4096}
-#      Keep those with σᵢ > threshold → Q ∈ ℝ^{4096 × r}
-#   2. Project H onto S_W:  H_proj = H Q Qᵀ
-#   3. Projection variance = ‖H_proj‖_F² / ‖H_centered‖_F²
-#
-# Compare to: variance explained by the top-r PCA components of H.
-# PCA gives the r-dimensional subspace that maximizes explained variance.
-# S_W is the r-dimensional subspace the model actually uses for scoring.
-#
-# Gap = var_pca_r − var_scoring_r ≥ 0
-#   Gap ≈ 0 → the scoring subspace is as informative as the best possible
-#              r-dimensional subspace. The model scores along its most variable directions.
-#   Gap >> 0 → the model uses directions that aren't the most variable in H.
-#              Scoring signal lives in a quieter corner of representation space.
-#
-# Note: this is a property of alignment between W and H, not of W alone.
+# ---
+# How much of H's variance lives in W's row space S_W?
+# Compare to the best possible r-dim subspace (top-r PCA of H).
+# Gap = var_pca_r - var_scoring ≥ 0; gap > 0 means scoring directions miss the most variable axes.
 
 def projection_variance(W, H):
     """
-    Args:
-        W : (N, 4096) weight matrix
-        H : (M, 4096) hidden states (will be centered internally)
-
-    Returns:
-        var_scoring : fraction of H variance in W's row space
-        var_pca_r   : fraction of H variance in top-r PCA subspace (r = rank(W))
-        rank_W      : effective rank of W (number of singular values > 1e-6)
+    Fraction of H variance in W's row space vs the best r-dim subspace (PCA).
+    Gap > 0 means scoring directions aren't the most variable directions in H.
     """
-    H_c = H - H.mean(axis=0, keepdims=True)          # center hidden states
+    H_c = H - H.mean(axis=0, keepdims=True)
 
-    # Orthonormal basis for W's row space from SVD
+    # orthonormal basis for W's row space
     _, S_w, Vt_w = np.linalg.svd(W, full_matrices=False)
     rank_W = int(np.sum(S_w > 1e-6))
     Q = Vt_w[:rank_W].T                              # (4096, rank_W)
 
-    # Project H onto S_W
     H_proj = H_c @ Q @ Q.T                           # (M, 4096)
 
     total_var   = np.linalg.norm(H_c, 'fro') ** 2
     proj_var    = np.linalg.norm(H_proj, 'fro') ** 2
     var_scoring = proj_var / total_var
 
-    # PCA comparison: best possible r-dimensional subspace
+    # PCA gives the best possible r-dim subspace for comparison
     pca = PCA(n_components=rank_W)
     pca.fit(H_c)
     var_pca_r = float(pca.explained_variance_ratio_.sum())
@@ -402,15 +234,13 @@ def projection_variance(W, H):
     return float(var_scoring), var_pca_r, rank_W
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PLOTTING
-# ══════════════════════════════════════════════════════════════════════════════
+# ---
 
 def plot_all(C_weight, S, svd_metrics, angles, cos_tri, sp_tri, slope, intercept, r2):
     fig = plt.figure(figsize=(18, 14))
     gs  = gridspec.GridSpec(2, 2, figure=fig, hspace=0.42, wspace=0.35)
 
-    # ── Panel 1: Weight-space cosine similarity heatmap ────────────────────
+    # panel 1: weight-space cosine similarity
     ax1 = fig.add_subplot(gs[0, 0])
     im = ax1.imshow(C_weight, cmap='RdBu_r', vmin=-1, vmax=1, aspect='auto')
     ax1.set_xticks(range(N)); ax1.set_yticks(range(N))
@@ -420,7 +250,7 @@ def plot_all(C_weight, S, svd_metrics, angles, cos_tri, sp_tri, slope, intercept
                   fontsize=10, fontweight='bold')
     plt.colorbar(im, ax=ax1, fraction=0.046, pad=0.04)
 
-    # ── Panel 2: Singular value spectrum of W ──────────────────────────────
+    # panel 2: singular value spectrum
     ax2  = fig.add_subplot(gs[0, 1])
     exp  = np.array(svd_metrics['explained_variance']) * 100
     cum  = np.array(svd_metrics['cumulative_variance']) * 100
@@ -439,7 +269,7 @@ def plot_all(C_weight, S, svd_metrics, angles, cos_tri, sp_tri, slope, intercept
         f'  Cond κ: {svd_metrics["condition_number"]:.1f}',
         fontsize=10, fontweight='bold')
 
-    # ── Panel 3: Principal angles ──────────────────────────────────────────
+    # panel 3: principal angles
     ax3 = fig.add_subplot(gs[1, 0])
     ax3.bar(range(1, len(angles)+1), angles, color='darkorange', alpha=0.8)
     ax3.axhline(45, color='gray',  linestyle='--', alpha=0.6, label='45° (random subspaces)')
@@ -452,7 +282,7 @@ def plot_all(C_weight, S, svd_metrics, angles, cos_tri, sp_tri, slope, intercept
                   'θ = arccos(σᵢ of Q_Aᵀ Q_B),   0° = aligned,  90° = orthogonal',
                   fontsize=10, fontweight='bold')
 
-    # ── Panel 4: Entanglement decomposition scatter ────────────────────────
+    # panel 4: entanglement decomposition scatter
     ax4 = fig.add_subplot(gs[1, 1])
     ax4.scatter(cos_tri, sp_tri, alpha=0.45, s=28, color='purple', zorder=3)
     x_line = np.linspace(cos_tri.min() - 0.02, cos_tri.max() + 0.02, 200)
@@ -475,9 +305,7 @@ def plot_all(C_weight, S, svd_metrics, angles, cos_tri, sp_tri, slope, intercept
     print(f"Saved figure → {out}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════════════════════
+# ---
 
 def main():
     print("\n── Loading data ────────────────────────────────────────────────────────────")
@@ -487,11 +315,10 @@ def main():
     head_scores  = np.load('outputs/head_scores.npy')       # (800, 2, 19)
     hidden_states = np.load('outputs/hidden_states.npy')    # (800, 2, 4096)
 
-    # Pool chosen and rejected into flat arrays
+    # pool chosen and rejected for geometry analysis
     scores_flat = head_scores.reshape(-1, N)                # (1600, 19)
     H_flat      = hidden_states.reshape(-1, 4096)           # (1600, 4096)
 
-    # ── Analysis 1: Gram matrix / cosine similarity ──────────────────────────
     print("\n── Analysis 1: Gram matrix / cosine similarity (C = ŴŴᵀ) ─────────────────")
     C, G, orth_gap, norms = gram_analysis(W)
 
@@ -508,7 +335,6 @@ def main():
     for a, b, v in large_cos_pairs[:10]:
         print(f"    {a:<26} ↔  {b:<26}  cos = {v:+.4f}")
 
-    # ── Analysis 2: SVD / effective rank ─────────────────────────────────────
     print("\n── Analysis 2: SVD and effective rank ──────────────────────────────────────")
     U, S, Vt, svd_metrics = svd_analysis(W)
 
@@ -518,11 +344,10 @@ def main():
     print(f"  Condition number κ    : {svd_metrics['condition_number']:.2f}")
     print(f"  k for 90% of W variance: {svd_metrics['k90']} singular vectors")
 
-    # ── Analysis 3: Principal angles ─────────────────────────────────────────
     print("\n── Analysis 3: Principal angles (W row space vs PCA subspace of H) ────────")
     pca = PCA(n_components=N)
     pca.fit(H_flat)
-    PCA_components = pca.components_    # (19, 4096) — top-19 PCA directions of H
+    PCA_components = pca.components_    # (19, 4096) top PCA directions of H
 
     angles = principal_angles(W, PCA_components)
     print(f"  Principal angles (degrees):")
@@ -531,7 +356,6 @@ def main():
     print(f"  (0° = perfectly aligned with PCA subspace of H)")
     print(f"  (90° = orthogonal to PCA subspace of H)")
 
-    # ── Analysis 4: Entanglement decomposition ────────────────────────────────
     print("\n── Analysis 4: Entanglement decomposition ──────────────────────────────────")
     C_weight, C_score, slope, intercept, r2, cos_tri, sp_tri = \
         entanglement_decomposition(W, scores_flat)
@@ -552,7 +376,6 @@ def main():
     else:
         print("  → R² is MODERATE: entanglement has both data-driven and architecture-driven sources.")
 
-    # ── Analysis 5: Projection variance ──────────────────────────────────────
     print("\n── Analysis 5: Projection variance ─────────────────────────────────────────")
     var_scoring, var_pca_r, rank_W = projection_variance(W, H_flat)
 
@@ -562,7 +385,6 @@ def main():
     print(f"  Alignment gap: {(var_pca_r - var_scoring)*100:.2f} pp")
     print(f"  (Gap > 0 means scoring subspace misses some of the most variable directions in H)")
 
-    # ── Save results ──────────────────────────────────────────────────────────
     results = {
         'orthogonality_gap'         : float(orth_gap),
         'svd_metrics'               : svd_metrics,
@@ -578,10 +400,8 @@ def main():
         json.dump(results, f, indent=2)
     print("\nSaved → outputs/geometry_results.json")
 
-    # ── Plots ─────────────────────────────────────────────────────────────────
     plot_all(C_weight, S, svd_metrics, angles, cos_tri, sp_tri, slope, intercept, r2)
 
-    # ── Summary ───────────────────────────────────────────────────────────────
     print("\n── Geometry Summary ─────────────────────────────────────────────────────────")
     print(f"  Orthogonality gap           : {orth_gap:.4f}   (0=orthogonal)")
     print(f"  Effective rank (entropy)    : {svd_metrics['entropy_rank']:.2f} / 19")

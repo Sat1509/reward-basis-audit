@@ -28,8 +28,6 @@ import numpy as np
 from scipy import stats
 import os
 
-# ── CONFIG ──────────────────────────────────────────────────────────────────
-
 INPUT_DIR = "outputs_helpsteer2"
 
 HEAD_NAMES = [
@@ -42,10 +40,7 @@ HEAD_NAMES = [
 HS2_DIMS = ["helpfulness", "correctness", "coherence", "complexity", "verbosity"]
 
 
-# ── BLOCK 1: LOAD OUTPUTS ──────────────────────────────────────────────────
-# What: Load the saved numpy arrays and the pair metadata.
-# Why: We need both the scores (to compute gaps) and the metadata
-#      (to know which pairs are type A vs type B, and which dimension).
+# ---
 
 print("Loading HelpSteer2 outputs ...")
 head_scores = np.load(os.path.join(INPUT_DIR, "head_scores.npy"))    # (N, 2, 19)
@@ -56,7 +51,6 @@ pairs = meta["pairs"]
 N = len(pairs)
 print(f"  {N} total pairs")
 
-# Split indices by type
 type_a_indices = [i for i, p in enumerate(pairs) if p["pair_type"] == "overall"]
 type_b_indices = {
     dim: [i for i, p in enumerate(pairs) if p["pair_type"] == f"targeted_{dim}"]
@@ -68,31 +62,24 @@ for dim in HS2_DIMS:
     print(f"  TYPE B ({dim}): {len(type_b_indices[dim])} pairs")
 
 
-# ── BLOCK 2: VALIDITY FUNCTION ──────────────────────────────────────────────
-# What: Given a set of (chosen, rejected) score pairs for one head,
-#       compute preference accuracy, mean gap, Cohen's d, and p-value.
-# Why: Preference accuracy is the ground truth test — what fraction of pairs
-#      did the head rank correctly? Cohen's d measures effect size.
-#      Wilcoxon tests whether the gap distribution is consistently positive.
-# Same implementation as validity_check.py — identical metrics, different data.
+# ---
+# identical metrics to validity_check.py — same test, different data
 
 def compute_validity(chosen_scores, rejected_scores):
     """
-    chosen_scores, rejected_scores: 1D arrays of shape (n_pairs,)
-    Returns: acc, mean_gap, cohen_d, p_value, interpretation
+    acc = fraction where chosen > rejected; cohen_d = mean_gap / std;
+    Wilcoxon signed-rank test for whether gap distribution is systematically positive.
     """
     gaps = chosen_scores - rejected_scores
     n = len(gaps)
-    
-    # Preference accuracy: fraction where chosen > rejected
+
     acc = (gaps > 0).mean()
     mean_gap = gaps.mean()
-    
-    # Cohen's d: effect size (mean gap / std of gaps)
+
     std = gaps.std()
     cohen_d = mean_gap / std if std > 0 else 0.0
-    
-    # Wilcoxon signed-rank test: is the gap distribution significantly positive?
+
+    # Wilcoxon signed-rank test
     if n < 10 or (gaps == 0).all():
         p_value = 1.0
     else:
@@ -100,8 +87,7 @@ def compute_validity(chosen_scores, rejected_scores):
             _, p_value = stats.wilcoxon(gaps, alternative="greater")
         except Exception:
             p_value = 1.0
-    
-    # Interpretation
+
     if acc >= 0.65 and p_value < 0.05:
         interp = "strongly valid"
     elif acc >= 0.55 and p_value < 0.05:
@@ -114,11 +100,8 @@ def compute_validity(chosen_scores, rejected_scores):
     return acc, mean_gap, cohen_d, p_value, interp
 
 
-# ── BLOCK 3: ANALYSIS 1 — OVERALL VALIDITY (TYPE A) ─────────────────────────
-# What: Run validity on all TYPE A pairs, one head at a time.
-# Why: Direct comparison to hh-rlhf. If HelpSteer2 overall validity
-#      looks similar to hh-rlhf, the dataset quality isn't the issue.
-#      If it's better, dataset cleanliness matters.
+# ---
+# TYPE A validity — if this looks similar to hh-rlhf, dataset quality isn't the issue
 
 print("\n── Analysis 1: Overall Validity (TYPE A pairs) ────────────────────────")
 print(f"  N = {len(type_a_indices)} pairs\n")
@@ -139,14 +122,9 @@ for j, head in enumerate(HEAD_NAMES):
     print(f"  {head:25s} {acc:.3f}  {gap:+.4f}  {d:+.3f}  {p_str:>10s}  {interp}")
 
 
-# ── BLOCK 4: ANALYSIS 2 — DIMENSION-TARGETED VALIDITY (TYPE B) ──────────────
-# What: For each of 5 dimensions, run validity only on pairs where
-#       that dimension was the controlled variable.
-#       Focus specifically on whether the MATCHING head is valid.
-# Why: This is the novel test. On a pair where helpfulness differs by 2+
-#      and everything else is controlled — does the helpfulness head agree?
-#      We report: (a) the matching head, and (b) all 19 heads, to see
-#      whether non-matching heads also activate (entanglement evidence).
+# ---
+# TYPE B: on pairs where helpfulness (or whichever dim) is isolated, does the matching head agree?
+# We also report all 19 heads — non-matching heads activating is entanglement evidence.
 
 print("\n── Analysis 2: Dimension-Targeted Validity (TYPE B pairs) ─────────────")
 
@@ -175,15 +153,12 @@ for target_dim in HS2_DIMS:
         print(f"  {head:25s} {acc:.3f}  {d:+.3f}  {interp}{match_marker}")
 
 
-# ── BLOCK 5: THE KEY COMPARISON TABLE ────────────────────────────────────────
-# What: For each of the 5 overlapping dimensions, show:
-#       hh-rlhf accuracy | HelpSteer2 overall accuracy | HelpSteer2 targeted accuracy
-# Why: This is the table that answers the core question.
-#      If targeted accuracy > overall > hh-rlhf, the heads work when given
-#      clean signal — dataset quality was the problem.
-#      If targeted accuracy is still low — the label doesn't match what's learned.
+# ---
+# key table: hh-rlhf acc → HS2 overall → HS2 targeted.
+# if targeted > overall > hh-rlhf: heads recover with clean signal → dataset problem.
+# if targeted is still low: the label doesn't match what's learned → model problem.
 
-# Load hh-rlhf results for comparison
+# load hh-rlhf results for comparison
 HHRLHF_RESULTS_PATH = "outputs/validity_results.json"
 hhrlhf_results = None
 if os.path.exists(HHRLHF_RESULTS_PATH):
@@ -198,7 +173,6 @@ if os.path.exists(HHRLHF_RESULTS_PATH):
         hs2_overall = results_overall.get(dim, {}).get("acc", float("nan"))
         hs2_targeted = results_targeted.get(dim, {}).get(dim, {}).get("acc", float("nan"))
         
-        # Trend: are things getting better as signal gets cleaner?
         if hs2_targeted > hs2_overall > hh_acc:
             trend = "↑ signal quality matters"
         elif hs2_targeted <= hh_acc:
@@ -212,7 +186,7 @@ else:
     print("  Run validity_check.py on hh-rlhf outputs first for the full comparison.")
 
 
-# ── BLOCK 6: SAVE RESULTS ────────────────────────────────────────────────────
+# ---
 
 out = {
     "overall": results_overall,

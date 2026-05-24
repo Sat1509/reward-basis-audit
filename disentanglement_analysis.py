@@ -1,18 +1,7 @@
 # disentanglement_analysis.py
-#
-# Research question answered here:
-#   Are ArmoRM's reward heads independent of each other?
-#   If "helpfulness" and "coherence" are highly correlated, they're not
-#   separate bases — they're the same thing with two different labels.
-#   That's a disentanglement failure, and a direct audit finding.
-#
-# Outputs:
-#   outputs/disentanglement_heatmap.png  — pairwise correlation matrix
-#   outputs/disentanglement_report.json  — numerical results + flagged pairs
-#
-# Usage:
-#   python disentanglement_analysis.py
-#   (Requires outputs/ populated by extract_scores_and_embeddings.py)
+# Tests whether ArmoRM's reward heads are statistically independent.
+# If "helpfulness" and "coherence" correlate strongly, they're the same signal with different labels —
+# a disentanglement failure. Requires outputs/ from extract_scores_and_embeddings.py.
 
 import numpy as np
 import json
@@ -29,21 +18,14 @@ REPORT_PATH  = os.path.join(SAVE_DIR, "disentanglement_report.json")
 ENTANGLEMENT_THRESHOLD = 0.7
 
 
-# ── Block 1: Build correlation matrix ─────────────────────────────────────────
+# ---
 
 def compute_correlation_matrix(chosen_scores, rejected_scores):
     """
-    Concatenates chosen and rejected scores into one pool (2N x num_heads),
-    then computes Spearman rank correlation between every pair of heads.
-
-    We use Spearman (not Pearson) because reward scores may not be
-    normally distributed — Spearman is rank-based and more robust.
-
-    Returns:
-        corr_matrix : (num_heads, num_heads) array of correlation coefficients
-        pval_matrix : (num_heads, num_heads) array of p-values
+    Pools chosen + rejected (2N, num_heads) and computes pairwise Spearman rank correlation.
+    Spearman rather than Pearson since reward scores aren't normally distributed.
     """
-    # Pool chosen and rejected — we want correlation over the full score distribution
+    # pool both splits — correlation should hold over the full distribution, not just chosen
     all_scores = np.vstack([chosen_scores, rejected_scores])  # (2N, num_heads)
 
     num_heads = all_scores.shape[1]
@@ -59,22 +41,18 @@ def compute_correlation_matrix(chosen_scores, rejected_scores):
     return corr_matrix, pval_matrix
 
 
-# ── Block 2: Flag entangled pairs ─────────────────────────────────────────────
+# ---
 
 def find_entangled_pairs(corr_matrix, threshold=ENTANGLEMENT_THRESHOLD):
     """
-    Scans the upper triangle of the correlation matrix.
-    Returns a list of (head_i, head_j, correlation) tuples where
-    |correlation| > threshold, excluding the diagonal (self-correlation = 1.0).
-
-    These are the pairs Rachel will ask about: why are two supposedly
-    distinct reward dimensions moving together?
+    Returns upper-triangle pairs where |corr| > threshold — heads that activate together
+    and are therefore not measuring distinct reward dimensions.
     """
     num_heads = corr_matrix.shape[0]
     entangled = []
 
     for i in range(num_heads):
-        for j in range(i + 1, num_heads):  # Upper triangle only
+        for j in range(i + 1, num_heads):
             corr = corr_matrix[i, j]
             if abs(corr) > threshold:
                 entangled.append({
@@ -83,30 +61,23 @@ def find_entangled_pairs(corr_matrix, threshold=ENTANGLEMENT_THRESHOLD):
                     "correlation": round(float(corr), 4)
                 })
 
-    # Sort by absolute correlation descending
     entangled.sort(key=lambda x: abs(x["correlation"]), reverse=True)
     return entangled
 
 
-# ── Block 3: Plot heatmap ─────────────────────────────────────────────────────
+# ---
 
 def plot_heatmap(corr_matrix, entangled_pairs):
-    """
-    Saves a correlation heatmap to outputs/disentanglement_heatmap.png.
-
-    Color scale: -1 (blue, perfect anti-correlation) to +1 (red, perfect correlation).
-    Diagonal is always 1.0 (each head perfectly correlates with itself).
-    Off-diagonal red cells are the finding: entangled heads.
-    """
+    """Saves pairwise Spearman correlation heatmap. Off-diagonal red cells = entangled heads."""
     fig, ax = plt.subplots(figsize=(10, 8))
 
     sns.heatmap(
         corr_matrix,
         xticklabels=HEAD_NAMES,
         yticklabels=HEAD_NAMES,
-        annot=True,          # Print correlation value in each cell
+        annot=True,
         fmt=".2f",
-        cmap="RdBu_r",       # Red = positive correlation, Blue = negative
+        cmap="RdBu_r",       # red = positive correlation, blue = negative
         vmin=-1, vmax=1,
         linewidths=0.5,
         ax=ax
@@ -127,14 +98,11 @@ def plot_heatmap(corr_matrix, entangled_pairs):
     print(f"Heatmap saved -> {HEATMAP_PATH}")
 
 
-# ── Block 4: Save report ───────────────────────────────────────────────────────
+# ---
 
 def save_report(corr_matrix, pval_matrix, entangled_pairs):
-    """
-    Saves numerical results to JSON for use in the README and blog post.
-    Includes the full matrix, flagged pairs, and a plain-language finding.
-    """
-    # Compute mean off-diagonal correlation as a single disentanglement score
+    """Saves full correlation matrix + flagged pairs to JSON."""
+    # mean abs off-diagonal as a scalar disentanglement summary
     num_heads = corr_matrix.shape[0]
     mask = ~np.eye(num_heads, dtype=bool)
     mean_off_diag = float(np.abs(corr_matrix[mask]).mean())
@@ -169,7 +137,7 @@ def save_report(corr_matrix, pval_matrix, entangled_pairs):
     return report
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ---
 
 def main():
     print("Loading outputs ...")
@@ -187,7 +155,6 @@ def main():
     print("\nSaving report ...")
     report = save_report(corr_matrix, pval_matrix, entangled_pairs)
 
-    # ── Print findings to console ──────────────────────────────────────────────
     print("\n── Disentanglement Findings ──────────────────────────────────────")
     print(f"Mean abs off-diagonal correlation : {report['mean_abs_off_diag_corr']}")
     print(f"Finding                           : {report['finding']}")
